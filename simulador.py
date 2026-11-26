@@ -1,524 +1,606 @@
+import copy
 import heapq
-import time
+import io
+import json
 import math
+import platform
+import time
+import zipfile
+from collections import deque
+from dataclasses import dataclass, field, asdict
+from itertools import product
+
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize
-import streamlit as st
+import scipy
+from scipy.special import log_ndtr
 
-# ==============================================================================
-# 1. DADOS DOCUMENTAIS DA TABELA 1 (PETROLINA - MOOVIT)
-# ==============================================================================
 ITINERARIOS = {
-    "011":        {"nome": "São Gonçalo R1",               "paradas": 76, "duracao_min": 76},
-    "012":        {"nome": "São Gonçalo R2",               "paradas": 76, "duracao_min": 73},
-    "013-CMEI":   {"nome": "Cohab VI vía CMEI",            "paradas": 69, "duracao_min": 81},
-    "013-Distr.": {"nome": "Cohab VI vía Distrito",        "paradas": 67, "duracao_min": 69},
-    "014":        {"nome": "Jardim Guararapes",            "paradas": 77, "duracao_min": 80},
-    "015":        {"nome": "Residencial Pomares",          "paradas": 63, "duracao_min": 69},
-    "031-Unif.":  {"nome": "Pedra Linda unificada",        "paradas": 72, "duracao_min": 66},
-    "031-N.T.":   {"nome": "Pedra Linda vía Novo Tempo",   "paradas": 68, "duracao_min": 61},
-    "041-J.M.":   {"nome": "Dom Avelar vía José e Maria",  "paradas": 80, "duracao_min": 67},
-    "041-Univ.":  {"nome": "Dom Avelar universitaria",     "paradas": 44, "duracao_min": 36},
-    "041-S.L.":   {"nome": "Dom Avelar vía Santa Luzia",   "paradas": 95, "duracao_min": 77},
+    '011': ('São Gonçalo R1', 76, 76), '012': ('São Gonçalo R2', 76, 73),
+    '013-CMEI': ('Cohab VI vía CMEI', 69, 81), '013-Distr.': ('Cohab VI vía Distrito', 67, 69),
+    '014': ('Jardim Guararapes', 77, 80), '015': ('Residencial Pomares', 63, 69),
+    '031-Unif.': ('Pedra Linda unificada', 72, 66), '031-N.T.': ('Pedra Linda vía Novo Tempo', 68, 61),
+    '041-J.M.': ('Dom Avelar vía José e Maria', 80, 67), '041-Univ.': ('Dom Avelar universitaria', 44, 36),
+    '041-S.L.': ('Dom Avelar vía Santa Luzia', 95, 77),
 }
-
-CENARIOS_ESTRESS = {
-    "Base": {"mult_demanda": 1.00, "mult_tempo": 1.00, "falha_veiculo": False},
-    "Demanda +20%": {"mult_demanda": 1.20, "mult_tempo": 1.00, "falha_veiculo": False},
-    "Demanda +40%": {"mult_demanda": 1.40, "mult_tempo": 1.00, "falha_veiculo": False},
-    "Tempo de percurso +25%": {"mult_demanda": 1.00, "mult_tempo": 1.25, "falha_veiculo": False},
-    "Indisponibilidade de veículo": {"mult_demanda": 1.00, "mult_tempo": 1.00, "falha_veiculo": True},
-    "Perturbações combinadas": {"mult_demanda": 1.20, "mult_tempo": 1.25, "falha_veiculo": True},
+CENARIOS = {
+    'Base': (1., 1., False), 'Demanda +20%': (1.2, 1., False),
+    'Demanda +40%': (1.4, 1., False), 'Tempo de percurso +25%': (1., 1.25, False),
+    'Indisponibilidade de veículo': (1., 1., True),
+    'Perturbações combinadas': (1.2, 1.25, True),
 }
+POLITICAS = ('Sem controle', 'Controle reativo', 'MPC nominal', 'RMPC')
+VERSION = '2.0-temporal-experimental'
+
+@dataclass(frozen=True)
+class Config:
+    h_min: int = 10
+    horas: float = 4.
+    aquecimento_min: int = 60
+    inicio_choque_min: int = 90
+    duracao_choque_min: int = 30
+    reserva_min: float = 10.
+    capacidade: int = 80
+    tau0: float = 5.
+    theta_b: float = 2.5
+    theta_d: float = 1.8
+    servico_nominal_extra: float = 6.
+    cv: float = .15
+    demanda: float = .12
+    pico: float = 1.25
+    passo_ctrl: int = 6
+    ganho: float = .5
+    dt: int = 60
+    H: int = 5
+    u_max: int = 180
+    passo_u: int = 60
+    alpha: float = .50
+    beta: float = .35
+    gamma: float = .15
+    W_ref: float = 5000.
+    n_omega: int = 5
+    raio: float = .20
+    max_avaliacoes: int = 24
+    max_s: float = 60.
+    tolerancia_rec: float = .20
+    n_rec: int = 3
+    n_boot: int = 2000
+
+    @property
+    def T(self): return int(self.horas * 3600)
+    @property
+    def warm(self): return self.aquecimento_min * 60
+    @property
+    def shock(self): return self.inicio_choque_min * 60
+    @property
+    def shock_end(self): return self.shock + self.duracao_choque_min * 60
+    @property
+    def h(self): return self.h_min * 60
+
+    def validate(self):
+        if not (0 <= self.warm <= self.shock < self.shock_end < self.T):
+            raise ValueError('Exigir 0 <= aquecimento <= início < fim do choque < T.')
+        if self.dt != 60 or self.H < 1 or self.h <= 0 or self.T % self.dt:
+            raise ValueError('Passo de 60 s, H positivo e T múltiplo de 60 s.')
+        if min(self.alpha, self.beta, self.gamma) < 0 or not np.isclose(self.alpha+self.beta+self.gamma, 1):
+            raise ValueError('Pesos não negativos devem somar 1.')
+        if not (self.n_omega >= 3 and self.max_avaliacoes >= 2 and self.max_s > 0 and 0 <= self.raio < 1):
+            raise ValueError('Parâmetros da otimização inválidos.')
+        if not (self.cv > 0 and self.capacidade > 0 and self.passo_ctrl > 0 and self.W_ref > 0 and self.passo_u > 0 and self.u_max > 0 and self.demanda >= 0):
+            raise ValueError('Parâmetros físicos inválidos.')
+
+@dataclass(frozen=True)
+class Route:
+    code: str
+    n: int
+    duration: float
+    m_arc: float
+    fleet: int
+    ctrl: frozenset
+    lam: np.ndarray
+    slots: int
+    refs: tuple
 
 
-# ==============================================================================
-# 2. MODELO PREDITIVO (MPC NOMINAL E RMPC MIN-MAX)
-# ==============================================================================
-def avaliar_custo_horizonte(
-    u_vec,
-    a_atual,
-    d_prev_paradas,
-    ocupacao_atual,
-    parada_atual,
-    n_paradas,
-    h_star,
-    m_arco,
-    lambda_s,
-    params,
-    mult_tempo=1.0,
-    mult_demanda=1.0,
-):
-    """Calcula a função objetivo J ao longo do horizonte H para um cenário ω."""
-    H = len(u_vec)
-    alpha, beta, gamma = params["alpha"], params["beta"], params["gamma"]
-    u_max = params["u_max"]
-    W_ref = params["W_ref"]
-    C_b = params["capacidade"]
-    tau_0 = params["tau_0"]
-    theta_B = params["theta_B"]
-    theta_D = params["theta_D"]
+def make_route(code, p):
+    _, n, duration = ITINERARIOS[code]
+    pure = max(duration*60*.65, duration*60 - n*(p.tau0+p.servico_nominal_extra))
+    lam = p.demanda/60 * (.5+np.sin(np.linspace(0,np.pi,n)))
+    lam[-1] = 0.
+    return Route(code,n,duration,pure/(n-1),math.ceil((duration+p.reserva_min)/p.h_min),
+                 frozenset(range(p.passo_ctrl,n-1,p.passo_ctrl)),lam,
+                 math.ceil(p.T/p.h), (n//2,n-1))
 
-    custo_total = 0.0
-    t_chegada = a_atual
-    ocup = float(ocupacao_atual)
+@dataclass(frozen=True)
+class World:
 
-    for j in range(H):
-        s = parada_atual + j
-        if s >= n_paradas - 1:
-            break
+    arrivals: tuple
+    arcs: np.ndarray
+    demand_mult: float
+    travel_mult: float
+    outage: bool
+    start: float
+    end: float
+    forecast: bool = False
 
-        # Estimativa de passagem do veículo anterior na parada s
-        d_prev = d_prev_paradas[s]
-        if d_prev is None:
-            h_est = h_star
+
+def in_shock(t, start, end): return start <= t < end
+
+
+def arrival_stream(route,p,rng,begin,end,dm,shock_start,shock_end,peak_factor=1.):
+
+    cuts=sorted(set([float(begin),float(end)]+[float(x) for x in (.3*p.T,.7*p.T,shock_start,shock_end) if begin<x<end]))
+    all_stops=[]
+    for s in range(route.n):
+        rows=[]
+        for a,b in zip(cuts,cuts[1:]):
+            mid=(a+b)/2
+            rate=route.lam[s]*peak_factor*(p.pico if .3*p.T<=mid<.7*p.T else 1.)*(dm if in_shock(mid,shock_start,shock_end) else 1.)
+            count=int(rng.poisson(rate*(b-a)))
+            if count:
+                ts=np.sort(rng.uniform(a,b,count))
+                dest=rng.integers(s+1,route.n,count)
+                offset=len(rows)
+                rows.extend((float(t),int(d),offset+i) for i,(t,d) in enumerate(zip(ts,dest)))
+        all_stops.append(tuple(rows))
+    return tuple(all_stops)
+
+
+def make_world(route,p,scenario,seed):
+    dm,tm,out=CENARIOS[scenario]
+    children=np.random.SeedSequence(seed).spawn(2)
+    arrivals=arrival_stream(route,p,np.random.default_rng(children[0]),0,p.T,dm,p.shock,p.shock_end)
+    s2=math.log1p(p.cv**2)
+    arcs=np.random.default_rng(children[1]).lognormal(-s2/2,math.sqrt(s2),(route.slots,route.n-1))
+    return World(arrivals,arcs,dm,tm,out,p.shock,p.shock_end)
+
+@dataclass
+class State:
+    events: list
+    queues: list
+    idx: list
+    synced: list
+    last_depart: list
+    recent: dict
+    free: set
+    pending: deque
+    onboard: dict = field(default_factory=dict)
+    assignment: dict = field(default_factory=dict)
+    moving: dict = field(default_factory=dict)
+    seq: int = 0
+    now: float = 0.
+    area: float = 0.
+    head: list = field(default_factory=list)
+    waits: list = field(default_factory=list)
+    denied: int = 0
+    denied_ids: set = field(default_factory=set)
+    holds: list = field(default_factory=list)
+    control_slots: set = field(default_factory=set)
+    used_slots: set = field(default_factory=set)
+    dispatched: int = 0
+    completed: int = 0
+    recovery: float = math.nan
+    solve_records: list = field(default_factory=list)
+
+
+def push(st,t,kind,*args):
+    st.seq+=1
+
+    heapq.heappush(st.events,(float(t),kind,st.seq,args))
+
+
+def initialize(route,p):
+    st=State([], [deque() for _ in range(route.n)], [0]*route.n, [0.]*route.n,
+             [None]*route.n,{s:deque(maxlen=p.n_rec) for s in route.refs},
+             set(range(route.fleet)),deque())
+    for b in range(route.slots): push(st,b*p.h,1,b)
+    push(st,p.shock_end,0,-1)
+    return st
+
+
+def sync_stop(st,w,s,t):
+    q=st.queues[s]; old=st.synced[s]
+    if t < old-1e-7: raise AssertionError('Tempo não monotônico.')
+    st.area += len(q)*max(0.,t-old)
+    arr=w.arrivals[s]; i=st.idx[s]
+    while i<len(arr) and arr[i][0]<=t:
+        a,d,uid=arr[i]; q.append((a,d,uid)); st.area+=max(0.,t-a); i+=1
+    st.idx[s]=i; st.synced[s]=t
+
+
+def sync_all(st,w,t):
+    for s in range(len(st.queues)): sync_stop(st,w,s,t)
+
+
+def dispatch(st,w,route,p,t):
+
+
+    avail=st.free-({0} if w.outage and in_shock(t,w.start,w.end) else set())
+    while st.pending and avail:
+        trip=st.pending.popleft(); vehicle=min(avail); avail.remove(vehicle); st.free.remove(vehicle)
+        st.assignment[trip]=vehicle; st.onboard[trip]=[]; st.dispatched+=1
+        push(st,t,2,trip,0)
+
+
+def reactive(st,route,p,trip,s,t):
+    prev=st.last_depart[s]
+    return 0. if prev is None else float(np.clip(p.ganho*(p.h-(t-prev)),0,p.u_max))
+
+
+def advance(st,w,route,p,end,policy,plan=None,origin=0.,record=False):
+    while st.events and st.events[0][0]<end:
+        t,kind,_,args=heapq.heappop(st.events); st.now=t
+        if kind==0:
+            vehicle=args[0]
+            if vehicle>=0: st.free.add(vehicle)
+            dispatch(st,w,route,p,t)
+        elif kind==1:
+            st.pending.append(args[0]); dispatch(st,w,route,p,t)
+        elif kind==2:
+            trip,s=args; st.moving.pop(trip,None); sync_stop(st,w,s,t)
+            riders=st.onboard[trip]
+            down=sum(d==s for d in riders)
+            riders[:]=[d for d in riders if d!=s]
+            q=st.queues[s]; board=min(len(q),p.capacidade-len(riders)) if s<route.n-1 else 0
+            for _ in range(board):
+                a,d,uid=q.popleft(); riders.append(d)
+                if record and p.warm<=a<p.T: st.waits.append(t-a)
+            if record and t>=p.warm and s<route.n-1:
+
+                for a,d,uid in q:
+                    if p.warm<=a<p.T: st.denied+=1; st.denied_ids.add((s,uid))
+            assert 0<=len(riders)<=p.capacidade
+            service=p.tau0+p.theta_b*board+p.theta_d*down
+            push(st,t+service,3,trip,s)
+        elif kind==3:
+            trip,s=args; u=0.
+            if s in route.ctrl:
+                k=int((t-origin)//p.dt)
+                key=(trip,k)
+                st.control_slots.add(key)
+                if key not in st.used_slots:
+                    st.used_slots.add(key)
+                    if policy=='Controle reativo': u=reactive(st,route,p,trip,s,t)
+                    elif policy in ('MPC nominal','RMPC') and plan is not None: u=plan.get(key,0.)
+                    assert 0<=u<=p.u_max
+                    st.holds.append((t,u))
+            push(st,t+u,4,trip,s)
         else:
-            h_est = max(0.0, t_chegada - d_prev)
-
-        # Demanda prevista e serviço
-        lam = lambda_s[s] * mult_demanda
-        chegadas_est = lam * h_est
-        prob_desc = min(0.95, 1.0 / max(1, (n_paradas - 1 - s)))
-        descensos = ocup * prob_desc
-        espaco = max(0.0, C_b - (ocup - descensos))
-        embarques = min(chegadas_est, espaco)
-
-        t_serv = tau_0 + theta_B * embarques + theta_D * descensos
-        u_j = u_vec[j]
-        t_saida = t_chegada + t_serv + u_j
-        ocup = min(C_b, max(0.0, ocup - descensos + embarques))
-
-        # Headway resultante após retenção
-        h_pos = h_star if d_prev is None else max(0.0, t_saida - d_prev)
-
-        # Componentes da função objetivo J
-        termo_h = alpha * ((h_pos - h_star) / h_star) ** 2
-        # Espera prevista: espera na parada (0.5 * lambda * h^2) + atraso a bordo (ocup * u)
-        W_j = 0.5 * lam * (h_pos ** 2) + ocup * u_j
-        termo_w = beta * (W_j / W_ref)
-        termo_u = gamma * ((u_j / u_max) ** 2)
-
-        custo_total += termo_h + termo_w + termo_u
-
-        # Próxima chegada prevista
-        t_chegada = t_saida + (m_arco * mult_tempo)
-
-    return custo_total
+            trip,s=args; prev=st.last_depart[s]
+            if prev is not None:
+                h=t-prev
+                assert h>=-1e-7
+                st.head.append((t,s,h))
+                if s in st.recent and prev>=p.shock_end: st.recent[s].append((t,h))
+            st.last_depart[s]=t
+            if s==route.n-1:
+                assert not st.onboard[trip]
+                vehicle=st.assignment.pop(trip); del st.onboard[trip]; st.completed+=1
+                push(st,t+p.reserva_min*60,0,vehicle)
+            else:
+                mult=w.travel_mult if in_shock(t,w.start,w.end) else 1.
+                travel=route.m_arc*w.arcs[trip,s]*mult
+                st.moving[trip]=(t,s+1)
+                push(st,t+travel,2,trip,s+1)
+    sync_all(st,w,end); st.now=end
 
 
-def calcular_retencao(
-    politica,
-    a_atual,
-    d_prev_paradas,
-    ocupacao_atual,
-    parada_atual,
-    n_paradas,
-    h_star,
-    m_arco,
-    lambda_s,
-    params,
-    omega_scenarios,
-):
-    """Determina a ação de retenção u (em segundos), tempo de cálculo e factibilidade."""
-    t0 = time.perf_counter()
-    u_max = params["u_max"]
+def prediction_snapshot(st,world,route,p,t):
 
-    if politica == "Sem controle":
-        return 0.0, 0.0, True
+    z=copy.copy(st)
+    z.events=[]
 
-    d_prev = d_prev_paradas[parada_atual]
-    if d_prev is None:
-        return 0.0, (time.perf_counter() - t0) * 1000.0, True
 
-    h_obs = max(0.0, a_atual - d_prev)
+    sigma2=math.log1p(p.cv**2); sigma=math.sqrt(sigma2)
+    for event in st.events:
+        et,kind,seq,args=event
+        if kind==2 and args[0] in st.moving:
+            trip,s=args; departure,next_stop=st.moving[trip]
+            assert s==next_stop
+            elapsed=max(0.,t-departure)
+            mean=route.m_arc*world.arcs[trip,s-1]*(world.travel_mult if in_shock(departure,world.start,world.end) else 1.)
+            if elapsed>0 and sigma>0:
+                mu=math.log(mean)-sigma2/2
+                a=(math.log(elapsed)-mu)/sigma
 
-    # Política reativa de referência (também usada como fallback seguro)
-    u_reativo = float(np.clip(params["k_reativo"] * (h_star - h_obs), 0.0, u_max))
+                conditional=mean*math.exp(float(log_ndtr(sigma-a)-log_ndtr(-a)))
+            else: conditional=mean
+            et=max(t+1e-6,departure+conditional)
+        z.events.append((et,kind,seq,args))
+    heapq.heapify(z.events)
+    if world.outage and t<world.end and world.end!=p.shock_end:
+        push(z,world.end,0,-1)
+    z.queues=[deque(q) for q in st.queues]
+    z.idx=[0]*len(st.idx); z.synced=list(st.synced); z.last_depart=list(st.last_depart)
+    z.recent={s:deque(v,maxlen=v.maxlen) for s,v in st.recent.items()}
+    z.free=set(st.free); z.pending=deque(st.pending)
+    z.onboard={b:list(v) for b,v in st.onboard.items()}; z.assignment=dict(st.assignment); z.moving=dict(st.moving)
+    z.area=0.; z.head=[]; z.waits=[]; z.holds=[]; z.denied_ids=set(); z.denied=0
+    z.control_slots=set(); z.used_slots=set(); z.solve_records=[]
+    return z
 
-    if politica == "Controle reativo":
-        return u_reativo, (time.perf_counter() - t0) * 1000.0, True
 
-    # MPC Nominal ou RMPC (horizonte deslizante H)
-    H = min(params["H"], max(1, (n_paradas - 1) - parada_atual))
-    u0 = np.full(H, u_reativo * 0.5, dtype=float)
-    bounds = [(0.0, u_max)] * H
+def forecast_worlds(route,p,scenario,seed,t,policy):
 
-    if politica == "MPC nominal":
-        def obj(u_vec):
-            return avaliar_custo_horizonte(
-                u_vec, a_atual, d_prev_paradas, ocupacao_atual,
-                parada_atual, n_paradas, h_star, m_arco, lambda_s, params,
-                mult_tempo=1.0, mult_demanda=1.0
-            )
-    else:  # RMPC: minimiza o pior custo dentro do conjunto de incertezas Ω
-        def obj(u_vec):
-            pior = -1.0
-            for mult_t, mult_d in omega_scenarios:
-                val = avaliar_custo_horizonte(
-                    u_vec, a_atual, d_prev_paradas, ocupacao_atual,
-                    parada_atual, n_paradas, h_star, m_arco, lambda_s, params,
-                    mult_tempo=mult_t, mult_demanda=mult_d
-                )
-                if val > pior:
-                    pior = val
-            return pior
 
-    res = minimize(
-        obj,
-        u0,
-        method="L-BFGS-B",
-        bounds=bounds,
-        options={"maxiter": 25, "ftol": 1e-4},
-    )
-    dt_ms = (time.perf_counter() - t0) * 1000.0
-
-    # Verifica factibilidade e limite computacional (60 s nominal, aqui 500 ms prático)
-    if res.success and np.all(np.isfinite(res.x)):
-        u_opt = float(np.clip(res.x[0], 0.0, u_max))
-        return u_opt, dt_ms, True
+    dm,tm,out=CENARIOS[scenario]; end=min(p.T,t+p.H*p.dt)
+    nominal=[]
+    if policy=='MPC nominal': specs=[(1.,1.,False)]
     else:
-        return u_reativo, dt_ms, False
+        lo=1-p.raio; hi=1+p.raio
+        specs=[(1.,1.,False),(hi,hi,True),(hi,lo,False),(lo,hi,False),(lo,lo,False)]
+        rg=np.random.default_rng(np.random.SeedSequence([seed,int(t),99]))
+        while len(specs)<p.n_omega: specs.append((float(rg.uniform(lo,hi)),float(rg.uniform(lo,hi)),bool(rg.integers(2))))
+        specs=specs[:p.n_omega]
+    for i,(mt,md,extra) in enumerate(specs):
+
+        rng=np.random.default_rng(np.random.SeedSequence([seed,int(t),12345]))
+        arr=arrival_stream(route,p,rng,t,end,dm,p.shock,p.shock_end,md)
 
 
-# ==============================================================================
-# 3. SIMULADOR A EVENTOS DISCRETOS (UMA RÉPLICA)
-# ==============================================================================
-def executar_replica(itinerario_cod, cenario_nome, politica, seed, params):
-    rng = np.random.default_rng(seed)
-
-    info = ITINERARIOS[itinerario_cod]
-    n_paradas = info["paradas"]
-    duracao_seg = info["duracao_min"] * 60.0
-    h_star = params["h_star_min"] * 60.0
-    cenario = CENARIOS_ESTRESS[cenario_nome]
-
-    # Calibração do tempo médio por arco (descontando serviço nominal aproximado)
-    serv_nominal_parada = params["tau_0"] + 6.0  # aproximação de embarque/desembarque base
-    tempo_viagem_puro = max(duracao_seg * 0.65, duracao_seg - n_paradas * serv_nominal_parada)
-    m_arco = (tempo_viagem_puro / max(1, n_paradas - 1)) * cenario["mult_tempo"]
-
-    # Parâmetros da Lognormal (Seção 2.3)
-    cv = params["cv"]
-    sigma2 = math.log(1.0 + cv ** 2)
-    sigma = math.sqrt(sigma2)
-    mu = math.log(m_arco) - 0.5 * sigma2
-
-    # Perfil de demanda sintético por parada (maior no miolo do trajeto)
-    idx = np.linspace(0, np.pi, n_paradas)
-    perfil_espacial = 0.5 + np.sin(idx)
-    lambda_base_seg = (params["demanda_pax_min_parada"] / 60.0) * cenario["mult_demanda"]
-    lambda_s = lambda_base_seg * perfil_espacial
-    lambda_s[-1] = 0.0  # terminal final não embarca
-
-    # Paradas autorizadas para retenção (z_{b,s,k} = 1)
-    passo_ctrl = params["passo_paradas_ctrl"]
-    paradas_ctrl = set(range(passo_ctrl, n_paradas - 1, passo_ctrl))
-
-    # Conjunto de cenários de incerteza Ω para o RMPC (determinístico dado o raio de robustez)
-    raio = params["raio_omega"]
-    n_omega = params["n_omega"]
-    rng_omega = np.random.default_rng(9999)
-    omega_scenarios = [(1.0, 1.0)]
-    if n_omega > 1:
-        # Inclui extremos e amostras dentro do conjunto de incerteza
-        omega_scenarios.append((1.0 + raio, 1.0 + raio))
-        omega_scenarios.append((1.0 + raio, 1.0 - 0.5 * raio))
-        omega_scenarios.append((1.0 - 0.5 * raio, 1.0 + raio))
-        while len(omega_scenarios) < n_omega:
-            mt = float(rng_omega.uniform(1.0 - 0.5 * raio, 1.0 + raio))
-            md = float(rng_omega.uniform(1.0 - 0.5 * raio, 1.0 + raio))
-            omega_scenarios.append((mt, md))
-        omega_scenarios = omega_scenarios[:n_omega]
-
-    # Pré-geração de tempos de arco por (viagem, parada) para garantir mesmas sementes entre políticas
-    n_viagens = params["n_viagens"]
-    tempos_arco = rng.lognormal(mean=mu, sigma=sigma, size=(n_viagens, n_paradas - 1))
-
-    # Pré-geração de sementes independentes por parada para chegadas de Poisson
-    # Fila de eventos: (tempo_chegada, id_viagem, parada)
-    eventos = []
-    viagem_falha = n_viagens // 3 if cenario["falha_veiculo"] else -1
-
-    for b in range(n_viagens):
-        if b == viagem_falha:
-            # Indisponibilidade temporária: viagem removida da operação
-            continue
-        t_partida = b * h_star
-        heapq.heappush(eventos, (t_partida, b, 0))
-
-    # Estados da rede
-    ocupacao = {b: 0 for b in range(n_viagens)}
-    ultima_saida_parada = [None] * n_paradas
-    fila_parada = [0] * n_paradas
-    tempos_chegada_fila = [[] for _ in range(n_paradas)]  # para cálculo exato de espera média e p95
-
-    # Métricas
-    headways_obs = []
-    esperas_pax = []
-    nao_embarcados = 0
-    retencao_total = 0.0
-    tempos_calc_ms = []
-    decisoes_factiveis = 0
-    decisoes_totais = 0
-
-    while eventos:
-        t_cheg, b, s = heapq.heappop(eventos)
-
-        # 1. Intervalo efetivo ordenado por passagem (evita headway negativo em ultrapassagens)
-        t_prev = ultima_saida_parada[s]
-        if t_prev is None:
-            dt_acum = h_star
-            h_efetivo = None
-        else:
-            dt_acum = max(0.0, t_cheg - t_prev)
-            h_efetivo = dt_acum
-
-        # 2. Chegadas de passageiros (Processo de Poisson no intervalo desde o ônibus anterior)
-        if s < n_paradas - 1 and dt_acum > 0:
-            # Fator pico no terço médio da simulação (Poisson não homogêneo)
-            fator_pico = 1.25 if (0.3 * n_viagens * h_star <= t_cheg <= 0.7 * n_viagens * h_star) else 1.0
-            media_cheg = lambda_s[s] * fator_pico * dt_acum
-            n_novos = int(rng.poisson(media_cheg))
-            if n_novos > 0:
-                t_ini = max(0.0, t_cheg - dt_acum)
-                chegadas_t = rng.uniform(t_ini, t_cheg, size=n_novos)
-                tempos_chegada_fila[s].extend(chegadas_t.tolist())
-                fila_parada[s] += n_novos
-
-        # 3. Desembarques (conservação de passageiros; 100% desembarcam no terminal final)
-        if s == n_paradas - 1:
-            descensos = ocupacao[b]
-        elif ocupacao[b] > 0:
-            prob_desc = min(1.0, 1.0 / max(1, (n_paradas - 1 - s)))
-            descensos = int(rng.binomial(ocupacao[b], prob_desc))
-        else:
-            descensos = 0
-
-        # 4. Embarques limitados pela capacidade C_b
-        espaco_disp = params["capacidade"] - (ocupacao[b] - descensos)
-        embarques = min(fila_parada[s], max(0, espaco_disp))
-        rejeitados = fila_parada[s] - embarques
-        if rejeitados > 0:
-            nao_embarcados += rejeitados
-
-        # Registra tempos de espera dos passageiros que embarcaram (FIFO)
-        if embarques > 0:
-            embarcados_t = tempos_chegada_fila[s][:embarques]
-            tempos_chegada_fila[s] = tempos_chegada_fila[s][embarques:]
-            esperas_pax.extend([max(0.0, t_cheg - tc) for tc in embarcados_t])
-            fila_parada[s] -= embarques
-
-        ocupacao[b] = ocupacao[b] - descensos + embarques
-
-        # 5. Tempo de serviço
-        t_serv = params["tau_0"] + params["theta_B"] * embarques + params["theta_D"] * descensos
-
-        # 6. Ação de controle (retenção) em paradas autorizadas
-        u_acao = 0.0
-        if s in paradas_ctrl and t_prev is not None:
-            u_acao, dt_ms, factivel = calcular_retencao(
-                politica=politica,
-                a_atual=t_cheg,
-                d_prev_paradas=ultima_saida_parada,
-                ocupacao_atual=ocupacao[b],
-                parada_atual=s,
-                n_paradas=n_paradas,
-                h_star=h_star,
-                m_arco=m_arco,
-                lambda_s=lambda_s,
-                params=params,
-                omega_scenarios=omega_scenarios,
-            )
-            retencao_total += u_acao
-            tempos_calc_ms.append(dt_ms)
-            decisoes_totais += 1
-            if factivel:
-                decisoes_factiveis += 1
-
-        # 7. Instante de saída e registro do headway após controle
-        t_saida = t_cheg + t_serv + u_acao
-        if t_prev is not None and s > 0:
-            headways_obs.append(max(0.0, t_saida - t_prev))
-        ultima_saida_parada[s] = t_saida
-
-        # 8. Agenda chegada na próxima parada
-        if s < n_paradas - 1:
-            t_prox = t_saida + float(tempos_arco[b, s])
-            heapq.heappush(eventos, (t_prox, b, s + 1))
-
-    # Consolidação dos indicadores da réplica
-    hw = np.array(headways_obs, dtype=float)
-    esp = np.array(esperas_pax, dtype=float) if esperas_pax else np.array([0.0])
-
-    rmse_h_min = float(np.sqrt(np.mean((hw - h_star) ** 2)) / 60.0) if len(hw) > 0 else 0.0
-    nrmse_h = float(np.sqrt(np.mean(((hw - h_star) / h_star) ** 2))) if len(hw) > 0 else 0.0
-    bunching_pct = float(np.mean(hw < 0.5 * h_star) * 100.0) if len(hw) > 0 else 0.0
-    espera_media_min = float(np.mean(esp) / 60.0)
-    espera_p95_min = float(np.percentile(esp, 95) / 60.0)
-    retencao_min = float(retencao_total / 60.0)
-    tempo_calc_medio = float(np.mean(tempos_calc_ms)) if tempos_calc_ms else 0.0
-    factibilidade_pct = float((decisoes_factiveis / decisoes_totais) * 100.0) if decisoes_totais > 0 else 100.0
-
-    return {
-        "RMSE_min": rmse_h_min,
-        "NRMSE": nrmse_h,
-        "Espera_media_min": espera_media_min,
-        "Espera_p95_min": espera_p95_min,
-        "Bunching_pct": bunching_pct,
-        "Nao_embarcados": float(nao_embarcados),
-        "Retencao_acum_min": retencao_min,
-        "Tempo_computo_ms": tempo_calc_medio,
-        "Factibilidade_pct": factibilidade_pct,
-    }
+        arcs=np.full((route.slots,route.n-1),mt)
+        outage_end=p.shock_end+(p.dt if extra and out else 0)
+        nominal.append(World(arr,arcs,dm,tm,out,p.shock,outage_end,True))
+    return nominal
 
 
-def bootstrap_ic95(valores, n_boot=500, seed=42):
-    arr = np.asarray(valores, dtype=float)
-    if len(arr) <= 1:
-        m = float(np.mean(arr))
-        return m, m, m
-    rng = np.random.default_rng(seed)
-    idx = rng.integers(0, len(arr), size=(n_boot, len(arr)))
-    medias = np.mean(arr[idx], axis=1)
-    return float(np.mean(arr)), float(np.percentile(medias, 2.5)), float(np.percentile(medias, 97.5))
+def forecast_cost(st,world,route,p,t,plan,collect=False):
+    z=prediction_snapshot(st,world,route,p,t); cost=0.
+    for j in range(p.H):
+        end=min(p.T,t+(j+1)*p.dt)
+        if end<=z.now: break
+        a0=z.area; h0=len(z.head); u0=len(z.holds)
+        advance(z,world,route,p,end,'RMPC',plan,t,False)
+        hs=[h for _,_,h in z.head[h0:]]; us=[u for _,u in z.holds[u0:]]
 
 
-# ==============================================================================
-# 4. INTERFACE STREAMLIT
-# ==============================================================================
-st.set_page_config(page_title="Simulador RMPC - Transporte Público", layout="wide")
-st.title("Simulador Estocástico RMPC — Redes Urbanas de Autobuses (Petrolina)")
-st.caption(
-    "Implementação computacional da metodologia e geração quantitativa da Tabela 3 "
-    "(comparação entre Sem Controle, Reativo, MPC Nominal e RMPC com sementes pareadas)."
-)
+        e=float(np.mean([(h/p.h-1)**2 for h in hs])) if hs else 0.
+        r=float(np.mean([(u/p.u_max)**2 for u in us])) if us else 0.
+        cost+=p.alpha*e+p.beta*(z.area-a0)/p.W_ref+p.gamma*r
+    return (cost,z.control_slots) if collect else cost
 
-with st.sidebar:
-    st.header("1. Escopo Experimental")
-    itinerario_sel = st.selectbox(
-        "Itinerário (Tabela 1)",
-        options=list(ITINERARIOS.keys()),
-        index=9,  # 041-Univ. por padrão (mais rápido para teste inicial)
-        format_func=lambda k: f"{k} — {ITINERARIOS[k]['nome']} ({ITINERARIOS[k]['paradas']} par., {ITINERARIOS[k]['duracao_min']} min)",
-    )
-    cenario_sel = st.selectbox("Cenário de perturbação", options=list(CENARIOS_ESTRESS.keys()), index=5)
-    h_star_min = st.selectbox("Intervalo programado h* (min)", options=[10, 15, 20], index=0)
-    n_replicas = st.slider("Número de réplicas (sementes)", min_value=5, max_value=200, value=20, step=5)
-    n_viagens = st.slider("Viagens consecutivas por réplica", min_value=6, max_value=24, value=12, step=2)
 
-    st.header("2. Parâmetros de Calibração")
-    demanda_base = st.number_input("Demanda média (pax/min por parada)", min_value=0.02, max_value=1.0, value=0.12, step=0.02)
-    passo_ctrl = st.slider("Retenção autorizada a cada N paradas", min_value=3, max_value=15, value=6)
-    k_reativo = st.slider("Ganho do controle reativo (k_p)", min_value=0.1, max_value=1.0, value=0.5, step=0.1)
+def optimize(st,route,p,scenario,seed,t,policy):
+    start=time.perf_counter(); worlds=forecast_worlds(route,p,scenario,seed,t,policy)
 
-    st.header("3. Parâmetros MPC / RMPC")
-    alpha = st.slider("Peso α (regularidade)", 0.0, 1.0, 0.50, 0.05)
-    beta = st.slider("Peso β (espera)", 0.0, 1.0 - alpha, min(0.35, 1.0 - alpha), 0.05)
-    gamma = round(max(0.0, 1.0 - alpha - beta), 2)
-    st.info(f"Peso γ (custo de retenção) = **{gamma:.2f}** (α + β + γ = 1)")
-    n_omega = st.slider("Nº de cenários robustos (N_ω)", min_value=3, max_value=12, value=5)
-    raio_omega = st.slider("Amplitude do conjunto Ω (±%)", min_value=5, max_value=40, value=20, step=5) / 100.0
 
-params = {
-    "h_star_min": h_star_min,
-    "capacidade": 80,
-    "theta_B": 2.5,
-    "theta_D": 1.8,
-    "tau_0": 5.0,
-    "cv": 0.15,
-    "u_max": 180.0,
-    "H": 5,
-    "W_ref": 5000.0,
-    "alpha": alpha,
-    "beta": beta,
-    "gamma": gamma,
-    "demanda_pax_min_parada": demanda_base,
-    "passo_paradas_ctrl": passo_ctrl,
-    "k_reativo": k_reativo,
-    "n_omega": n_omega,
-    "raio_omega": raio_omega,
-    "n_viagens": n_viagens,
-}
+    keys=set(); base=[]
+    for w in worlds:
+        c,k=forecast_cost(st,w,route,p,t,{},True); base.append(c); keys.update(k)
+    if not keys or not any(k==0 for _,k in keys): return {},0.,'sem_oportunidade',1,0
+    best={}; val=max(base); evaluations=1; timed_out=False
 
-if st.button("Executar Simulação Comparativa", type="primary"):
-    politicas = ["Sem controle", "Controle reativo", "MPC nominal", "RMPC"]
-    progresso = st.progress(0)
-    status = st.empty()
+    alphabet=sorted(set(range(p.passo_u,p.u_max+1,p.passo_u))|{p.u_max})
+    for key in sorted(keys,key=lambda x:(x[1],x[0])):
+        local_best=best; local_val=val
+        for u in alphabet:
+            if evaluations>=p.max_avaliacoes: break
+            if time.perf_counter()-start>=p.max_s: timed_out=True; break
+            candidate=dict(best); candidate[key]=float(u)
+            worst=max(forecast_cost(st,w,route,p,t,candidate) for w in worlds); evaluations+=1
+            if worst<local_val-1e-9: local_best=candidate; local_val=worst
+        best,val=local_best,local_val
+        if evaluations>=p.max_avaliacoes or timed_out: break
+    elapsed=time.perf_counter()-start
+    if timed_out or elapsed>=p.max_s or not math.isfinite(val): return {},elapsed*1000,'fallback',evaluations,len(keys)
+    return best,elapsed*1000,'factível_aproximado',evaluations,len(keys)
 
-    registros = []
-    total_passos = len(politicas) * n_replicas
-    passo_atual = 0
 
-    for pol in politicas:
-        for r in range(n_replicas):
-            seed = 1000 + r  # Mesmas sementes aleatórias para todas as políticas
-            res = executar_replica(itinerario_sel, cenario_sel, pol, seed, params)
-            res["Politica"] = pol
-            res["Seed"] = seed
-            registros.append(res)
-            passo_atual += 1
-            progresso.progress(passo_atual / total_passos)
-            status.text(f"Executando {pol} — réplica {r + 1}/{n_replicas}...")
+def recovered(st,route,p,t):
+    if t<p.shock_end: return False
+    return all(len(st.recent[s])==p.n_rec and t-st.recent[s][-1][0]<=(1+p.tolerancia_rec)*p.h
+               and all(abs(h/p.h-1)<=p.tolerancia_rec for _,h in st.recent[s]) for s in route.refs)
 
-    status.success("Simulação concluída com sucesso!")
-    df_bruto = pd.DataFrame(registros)
 
-    # Monta a Tabela 3 com média e IC 95% bootstrap
-    metricas_nomes = [
-        ("RMSE_min", "RMSE de intervalos (min)"),
-        ("NRMSE", "NRMSE de intervalos"),
-        ("Espera_media_min", "Espera média (min)"),
-        ("Espera_p95_min", "Espera p95 (min)"),
-        ("Bunching_pct", "Bunching h < 0,5h* (%)"),
-        ("Nao_embarcados", "Passageiros não embarcados"),
-        ("Retencao_acum_min", "Retenção acumulada (min)"),
-        ("Tempo_computo_ms", "Tempo de cómputo (ms/decisão)"),
-        ("Factibilidade_pct", "Factibilidade (%)"),
-    ]
+def run_replica(code,scenario,policy,seed,p,world=None):
+    p.validate(); route=make_route(code,p)
+    w=world if world is not None else make_world(route,p,scenario,seed)
+    st=initialize(route,p)
+    for t in range(0,p.T,p.dt):
+        plan={}; active=policy
+        st.used_slots=set(); st.control_slots=set()
+        if policy in ('MPC nominal','RMPC'):
 
-    linhas_tabela3 = []
-    for col, rotulo in metricas_nomes:
-        linha = {"Indicador": rotulo}
-        for pol in politicas:
-            vals = df_bruto.loc[df_bruto["Politica"] == pol, col].values
-            m, lo, hi = bootstrap_ic95(vals)
-            linha[pol] = f"{m:.2f} [{lo:.2f}; {hi:.2f}]"
-        linhas_tabela3.append(linha)
 
-    df_tabela3 = pd.DataFrame(linhas_tabela3)
+            if st.onboard or st.pending or (st.events and st.events[0][0]<t+p.dt):
+                plan,ms,status,ev,nkeys=optimize(st,route,p,scenario,seed,t,policy)
+                if status!='sem_oportunidade' and t>=p.warm:
+                    st.solve_records.append((ms,status,ev,nkeys))
+                if status=='fallback': active='Controle reativo'
+        advance(st,w,route,p,t+p.dt,active,plan,t,True)
+        if scenario!='Base' and math.isnan(st.recovery) and recovered(st,route,p,t+p.dt):
+            st.recovery=(t+p.dt-p.shock_end)/60
 
-    st.subheader(f"Tabela 3 Preenchida — Itinerário {itinerario_sel} | Cenário: {cenario_sel}")
-    st.caption(f"Valores reportados como Média [IC 95% bootstrap] sobre {n_replicas} réplicas pareadas.")
-    st.dataframe(df_tabela3, use_container_width=True, hide_index=True)
+    residual=[p.T-a for q in st.queues for a,_,_ in q if p.warm<=a<p.T]
+    cohort=sum(sum(p.warm<=a<p.T for a,_,_ in rows) for rows in w.arrivals)
+    assert len(st.waits)+len(residual)==cohort, (len(st.waits),len(residual),cohort)
+    hw=np.array([h for t,s,h in st.head if t>=p.warm and s>0],dtype=float)
+    waits=np.array(st.waits,dtype=float); restricted=np.array(st.waits+residual,dtype=float)
+    def mean(v): return float(np.mean(v)) if len(v) else math.nan
+    def pct(v): return float(np.percentile(v,95)) if len(v) else math.nan
+    records=st.solve_records
+    follow=(p.T-p.shock_end)/60
+    rec=st.recovery
+    return {'Itinerario':code,'Cenario':scenario,'h_min':p.h_min,'Politica':policy,'Seed':seed,
+        'RMSE_min':float(np.sqrt(np.mean((hw-p.h)**2))/60) if len(hw) else math.nan,
+        'NRMSE':float(np.sqrt(np.mean((hw/p.h-1)**2))) if len(hw) else math.nan,
+        'Bunching_pct':mean(hw<.5*p.h)*100,
+        'Espera_media_min':mean(waits)/60,'Espera_p95_min':pct(waits)/60,
+        'Espera_restrita_media_min':mean(restricted)/60,'Espera_restrita_p95_min':pct(restricted)/60,
+        'Chegadas_coorte':cohort,'Embarcados_coorte':len(waits),'Fila_residual':len(residual),
+        'Fila_residual_pct':100*len(residual)/cohort if cohort else math.nan,
+        'Denegacoes_eventos':st.denied,'Passageiros_denegados_unicos':len(st.denied_ids),
+        'Retencao_acum_min':sum(u for t,u in st.holds if t>=p.warm)/60,
+        'Tempo_computo_ms':mean([x[0] for x in records]),'Tempo_computo_p95_ms':pct([x[0] for x in records]),
+        'Factibilidade_pct':100*mean([x[1]=='factível_aproximado' for x in records]),
+        'Fallbacks':sum(x[1]=='fallback' for x in records),'Otimizacoes':len(records),
+        'Recuperou_pct':(100. if math.isfinite(rec) else 0.) if scenario!='Base' else math.nan,
+        'Tempo_recuperacao_min':rec,'Tempo_recuperacao_restrito_min':(rec if math.isfinite(rec) else follow) if scenario!='Base' else math.nan,
+        'Frota_sintetica':route.fleet,'Viagens_previstas':route.slots,'Viagens_iniciadas':st.dispatched,
+        'Viagens_concluidas':st.completed,'Partidas_pendentes':len(st.pending),'Headways_n':len(hw)}
 
-    # Gráficos comparativos rápidos
-    st.subheader("Comparação Visual das Médias")
-    df_medias = df_bruto.groupby("Politica", sort=False).mean(numeric_only=True)
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown("**RMSE de Intervalos (min)**")
-        st.bar_chart(df_medias["RMSE_min"])
-    with col2:
-        st.markdown("**Espera Média (min)**")
-        st.bar_chart(df_medias["Espera_media_min"])
-    with col3:
-        st.markdown("**Bunching (%)**")
-        st.bar_chart(df_medias["Bunching_pct"])
 
-    # Downloads para o artigo
-    c_dl1, c_dl2 = st.columns(2)
-    with c_dl1:
-        st.download_button(
-            "Baixar Tabela 3 (CSV)",
-            data=df_tabela3.to_csv(index=False).encode("utf-8"),
-            file_name=f"tabela3_{itinerario_sel}_{cenario_sel.replace(' ', '_')}.csv",
-            mime="text/csv",
-        )
-    with c_dl2:
-        st.download_button(
-            "Baixar Dados Brutos por Réplica (CSV)",
-            data=df_bruto.to_csv(index=False).encode("utf-8"),
-            file_name=f"replicas_{itinerario_sel}_{cenario_sel.replace(' ', '_')}.csv",
-            mime="text/csv",
-        )
+METRICAS={
+ 'RMSE_min':'RMSE de intervalos (min)','NRMSE':'NRMSE de intervalos', 'Bunching_pct':'Bunching (%)',
+ 'Espera_media_min':'Espera média dos embarcados (min)','Espera_p95_min':'Espera p95 dos embarcados (min)',
+ 'Espera_restrita_media_min':'Espera média observada até T (min)','Espera_restrita_p95_min':'Espera p95 observada até T (min)',
+ 'Fila_residual_pct':'Passageiros ainda em espera (%)','Denegacoes_eventos':'Embarques denegados (ocorrências)',
+ 'Passageiros_denegados_unicos':'Passageiros distintos com denegação','Retencao_acum_min':'Retenção acumulada (min)',
+ 'Tempo_computo_ms':'Tempo de cálculo (ms/otimização)','Tempo_computo_p95_ms':'p95 do tempo de cálculo (ms)',
+ 'Factibilidade_pct':'Planos factíveis retornados (%)','Recuperou_pct':'Recuperação até T (%)',
+ 'Tempo_recuperacao_restrito_min':'Tempo até recuperação ou fim do seguimento (min)',
+ 'Viagens_iniciadas':'Viagens iniciadas','Partidas_pendentes':'Partidas ainda pendentes'}
+
+
+def bootstrap(v,n=2000,seed=42):
+    a=np.asarray(v,dtype=float); a=a[np.isfinite(a)]
+    if not len(a): return math.nan,math.nan,math.nan,0
+    m=float(a.mean())
+    if len(a)<2: return m,math.nan,math.nan,len(a)
+    rng=np.random.default_rng(seed); means=a[rng.integers(0,len(a),(n,len(a)))].mean(axis=1)
+    lo,hi=np.percentile(means,[2.5,97.5]); return m,float(lo),float(hi),len(a)
+
+
+def summarize(df,p):
+    group=['Itinerario','Cenario','h_min']; tables=[]; diffs=[]
+    for keys,g in df.groupby(group,sort=False):
+        for metric,label in METRICAS.items():
+            row=dict(zip(group,keys)); row.update({'Metrica':metric,'Indicador':label})
+            for pol in POLITICAS:
+                m,lo,hi,n=bootstrap(g.loc[g.Politica==pol,metric],p.n_boot)
+                row[pol]=f'{m:.3f} [{lo:.3f}; {hi:.3f}] (n={n})' if n>=2 else (f'{m:.3f} (n=1; IC indisponível)' if n else 'N/A')
+            tables.append(row)
+            pv=g.pivot(index='Seed',columns='Politica',values=metric)
+            for comparator in POLITICAS[:-1]:
+                if 'RMPC' not in pv or comparator not in pv: continue
+                d=(pv['RMPC']-pv[comparator]).to_numpy(); m,lo,hi,n=bootstrap(d,p.n_boot)
+                diffs.append(dict(zip(group,keys))|{'Metrica':metric,'Comparador':comparator,'Diferenca_RMPC_menos_comparador':m,'IC95_inf':lo,'IC95_sup':hi,'Pares_validos':n})
+    return pd.DataFrame(tables),pd.DataFrame(diffs)
+
+
+def run_batch(codes,scenarios,hs,n_rep,p,seed0=1000,progress=None):
+    from dataclasses import replace
+    records=[]; total=len(codes)*len(scenarios)*len(hs)*n_rep*len(POLITICAS); done=0
+    for code,scenario,h in product(codes,scenarios,hs):
+        cfg=replace(p,h_min=int(h)); route=make_route(code,cfg)
+        for seed in range(seed0,seed0+n_rep):
+            w=make_world(route,cfg,scenario,seed)
+            cohort=[]
+            for pol in POLITICAS:
+                r=run_replica(code,scenario,pol,seed,cfg,w); records.append(r); cohort.append(r['Chegadas_coorte']); done+=1
+                if progress: progress(done,total,code,scenario,h,seed,pol)
+            assert len(set(cohort))==1,'Demanda exógena não pareada.'
+    df=pd.DataFrame(records); table,diff=summarize(df,p)
+    return df,table,diff
+
+
+def export_zip(df,table,diff,p,codes,scenarios,hs,n_rep,seed0):
+    meta={'version':VERSION,'config':asdict(p),'itinerarios':list(codes),'cenarios':list(scenarios),'intervalos':list(hs),
+          'replicas':n_rep,'seed_inicial':seed0,'python':platform.python_version(),'numpy':np.__version__,
+          'pandas':pd.__version__,'scipy':scipy.__version__,'platform':platform.platform(),
+          'escopo':'itinerários isolados sintéticos; sem validação empírica da operação real'}
+    try:
+        from importlib.metadata import version
+        meta['streamlit']=version('streamlit')
+    except Exception:
+        meta['streamlit']=None
+    b=io.BytesIO()
+    with zipfile.ZipFile(b,'w',zipfile.ZIP_DEFLATED) as z:
+        for name,data in [('replicas.csv',df),('tabela3.csv',table),('diferencas_pareadas.csv',diff)]: z.writestr(name,data.to_csv(index=False))
+        z.writestr('parametros.json',json.dumps(meta,ensure_ascii=False,indent=2))
+    return b.getvalue()
+
+
+def app():
+    import streamlit as st
+    st.set_page_config(page_title='Simulador RMPC — A1',layout='wide')
+    st.title('Simulador estocástico RMPC — Petrolina')
+    st.caption('Versão 2.0 experimental | Δt = 60 s | itinerários isolados | busca min-max aproximada')
+    st.warning('Parâmetros sintéticos. Resultados não são estimativas da operação real. Execute pilotos antes do lote definitivo.')
+    with st.sidebar:
+        st.header('Escopo experimental')
+        codes=st.multiselect('Itinerários',list(ITINERARIOS),default=['041-Univ.'])
+        scenarios=st.multiselect('Cenários',list(CENARIOS),default=['Perturbações combinadas'])
+        hs=st.multiselect('Intervalos (min)',[10,15,20],default=[10])
+        n_rep=st.number_input('Réplicas por combinação',1,2000,2)
+        seed0=st.number_input('Semente inicial',0,2000000000,1000)
+        horas=st.number_input('Duração da simulação (h)',2.,12.,4.,step=.5)
+        warm=st.number_input('Aquecimento (min)',0,180,60)
+        shock=st.number_input('Início do choque (min)',0,600,90)
+        duration=st.number_input('Duração do choque (min)',1,180,30)
+        st.header('Parâmetros operacionais')
+        demanda=st.number_input('Demanda (pax/min/parada)',.02,1.,.12,step=.02)
+        cv=st.number_input('CV do tempo de arco',.01,.8,.15,step=.05)
+        cap=st.number_input('Capacidade',20,160,80)
+        reserva=st.number_input('Reserva terminal sintética (min)',0.,60.,10.)
+        passo=st.slider('Retenção a cada N paradas',3,15,6)
+        ganho=st.slider('Ganho reativo',.1,1.,.5)
+        st.header('Controladores preditivos')
+        H=st.slider('Horizonte (decisões de 60 s)',1,20,5)
+        alpha=st.slider('α — regularidade',0.,1.,.50,.05)
+        beta=st.slider('β — espera',0.,1.,.35,.05)
+        gamma=1-alpha-beta
+        st.write(f'γ — intervenção: {gamma:.2f}')
+        wref=st.number_input('W_ref (passageiros-segundo)',100.,100000.,5000.,step=100.)
+        nomega=st.slider('Cenários robustos',3,12,5)
+        raio=st.slider('Amplitude simétrica de incerteza (%)',5,40,20)/100
+        passo_u=st.selectbox('Discretização da retenção (s)',[15,30,60,90],index=2)
+        maxeval=st.number_input('Máximo de planos avaliados por decisão',2,200,24)
+    p=Config(horas=float(horas),aquecimento_min=int(warm),inicio_choque_min=int(shock),duracao_choque_min=int(duration),
+             demanda=demanda,cv=cv,capacidade=int(cap),reserva_min=reserva,passo_ctrl=passo,ganho=ganho,H=H,
+             alpha=alpha,beta=beta,gamma=max(0.,gamma),W_ref=wref,n_omega=nomega,raio=raio,passo_u=passo_u,max_avaliacoes=int(maxeval))
+    total=len(codes)*len(scenarios)*len(hs)*int(n_rep)*4
+    st.write(f'Execuções previstas: {total}. Cada combinação contém quatro políticas e as mesmas realizações exógenas.')
+    if st.button('Executar simulação comparativa',type='primary'):
+        try:
+            if not total: raise ValueError('Selecione itinerários, cenários e intervalos.')
+            if gamma < -1e-9: raise ValueError('α + β não pode ultrapassar 1.')
+            p.validate()
+            bar=st.progress(0.); status=st.empty()
+            def update(done,total,c,s,h,seed,pol):
+                bar.progress(done/total); status.text(f'{done}/{total} | {c} | {s} | h={h} | seed={seed} | {pol}')
+            df,table,diff=run_batch(codes,scenarios,hs,int(n_rep),p,int(seed0),update)
+            archive=export_zip(df,table,diff,p,codes,scenarios,hs,int(n_rep),int(seed0))
+            st.session_state['resultado_v2']=(df,table,diff,archive)
+            status.success('Execução concluída.')
+        except Exception as e: st.exception(e)
+    if 'resultado_v2' in st.session_state:
+        df,table,diff,archive=st.session_state['resultado_v2']
+        st.subheader('Tabela 3 — médias e IC 95% bootstrap por combinação')
+        st.dataframe(table,use_container_width=True,hide_index=True)
+        st.caption('N/A: não aplicável ou sem observação. IC das diferenças pareadas na tabela seguinte. Espera dos embarcados deve ser lida com fila residual e espera observada até T; esta última é truncada, não espera completa.')
+        st.subheader('Diferenças pareadas: RMPC menos comparador')
+        st.dataframe(diff,use_container_width=True,hide_index=True)
+        st.subheader('Comparação visual por combinação')
+        combos=list(df[['Itinerario','Cenario','h_min']].drop_duplicates().itertuples(index=False,name=None))
+        c,s,h=st.selectbox('Combinação para gráficos',combos,format_func=lambda x:f'{x[0]} | {x[1]} | h={x[2]} min')
+        subset=df[(df.Itinerario==c)&(df.Cenario==s)&(df.h_min==h)]
+        means=subset.groupby('Politica').mean(numeric_only=True).reindex(POLITICAS)
+        for col,(metric,label) in zip(st.columns(3), [('RMSE_min','RMSE (min)'),('Espera_restrita_media_min','Espera observada até T (min)'),('Bunching_pct','Agrupamento (%)')]):
+            with col:
+                st.markdown(f'**{label}**'); st.bar_chart(means[metric])
+        st.subheader('Dados por réplica'); st.dataframe(df,use_container_width=True,hide_index=True)
+        st.download_button('Baixar pacote de resultados e parâmetros (ZIP)',archive,'RMPC_resultados.zip','application/zip')
+        st.download_button('Baixar Tabela 3 (CSV)',table.to_csv(index=False).encode('utf-8-sig'),'tabela3.csv','text/csv')
+        st.download_button('Baixar réplicas (CSV)',df.to_csv(index=False).encode('utf-8-sig'),'replicas.csv','text/csv')
+
+
+def self_test():
+
+    p=Config(horas=.75,aquecimento_min=0,inicio_choque_min=10,duracao_choque_min=10,H=5,max_avaliacoes=5,n_omega=3)
+    route=make_route('041-Univ.',p); w=make_world(route,p,'Perturbações combinadas',1000)
+    results=[run_replica(route.code,'Perturbações combinadas',pol,1000,p,w) for pol in POLITICAS]
+    assert len({r['Chegadas_coorte'] for r in results})==1
+    assert all(r['Embarcados_coorte']+r['Fila_residual']==r['Chegadas_coorte'] for r in results)
+    assert all(r['Viagens_iniciadas']<=r['Viagens_previstas'] for r in results)
+    df=pd.DataFrame(results); table,diff=summarize(df,p)
+    assert len(table)==len(METRICAS) and len(diff)==3*len(METRICAS)
+    assert all(r['Otimizacoes']>0 for r in results[2:])
+    assert results[0]['Retencao_acum_min']==0
+    print(df[['Politica','Chegadas_coorte','RMSE_min','Fila_residual','Otimizacoes','Fallbacks']].to_string(index=False))
+    print('SELF-TEST OK — não usar como resultados do artigo.')
+
+if __name__=='__main__':
+    import sys
+    if '--self-test' in sys.argv: self_test()
+    else: app()
